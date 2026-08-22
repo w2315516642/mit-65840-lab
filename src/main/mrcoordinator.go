@@ -9,10 +9,13 @@ package main
 // Please do not change this file.
 //
 
-import "6.5840/mr"
-import "time"
-import "os"
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"6.5840/mr"
+)
 
 func main() {
 	if len(os.Args) < 3 {
@@ -22,6 +25,7 @@ func main() {
 
 	m := mr.MakeCoordinator(os.Args[1], os.Args[2:], 10)
 	for m.Done() == false {
+		fmt.Println("Haven't done yet.")
 		time.Sleep(time.Second)
 	}
 

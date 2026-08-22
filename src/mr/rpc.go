@@ -11,13 +11,16 @@ package mr
 // and reply for an RPC.
 //
 
-type ExampleArgs struct {
-	X int
+type Request struct {
+	WorkerId       int
+	FinishedTaskId int
 }
 
-type ExampleReply struct {
-	Y int
+type Reply struct {
+	MapDone   bool
+	FilePath  string
+	NumReduce int
+	TaskId    int
 }
 
 // Add your RPC definitions here.
-

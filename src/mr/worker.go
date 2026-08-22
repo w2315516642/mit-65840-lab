@@ -1,17 +1,27 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+	"strconv"
+	"time"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
 }
+
+var (
+	ErrGetTaskFailed    = errors.New("[worker]: Get task failed.")
+	ErrReportTaskFailed = errors.New("[worker]: Report finished task failed.")
+	SuccessAllTaskDone  = errors.New("[worker]: All tasks done.")
+)
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -23,44 +33,103 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
-
 // main/mrworker.go calls this function.
-func Worker(sockname string, mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
+func Worker(
+	sockname string,
+	mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string,
+) {
 	coordSockName = sockname
 
 	// Your worker implementation here.
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	for {
+		err := RunOneLoop(mapf)
+		if err == SuccessAllTaskDone {
+			break
+		}
 
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func RunOneLoop(mapf func(string, string) []KeyValue) error {
+	reply, err := GetTask()
+	if err != nil {
+		fmt.Println("error")
+		return ErrGetTaskFailed
+	}
+
+	if reply.MapDone {
+		return SuccessAllTaskDone
+	}
+
+	file := reply.FilePath
+	taskID := reply.TaskId
+
+	contents, _ := os.ReadFile(file)
+	kva := mapf(file, string(contents))
+
+	for i := 0; i < reply.NumReduce; i++ {
+		oname := "mr-" + strconv.Itoa(taskID) + "-" + strconv.Itoa(i)
+		os.Remove(oname)
+	}
+
+	for _, kv := range kva {
+		out_id := ihash(kv.Key) % reply.NumReduce
+		out_id_str := strconv.Itoa(out_id)
+		oname := "mr-" + strconv.Itoa(taskID) + "-" + out_id_str
+		ofile, oErr := os.OpenFile(oname,
+			os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o666)
+		if oErr != nil {
+			fmt.Println("[worker]: Open file failed: ", oErr)
+			return ErrGetTaskFailed
+		}
+		fmt.Fprintf(ofile, "%v %v\n", kv.Key, kv.Value)
+		ofile.Close()
+	}
+
+	return ReportOneTask(taskID)
 }
 
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
+func GetTask() (Reply, error) {
 	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
+	args := Request{}
+	args.WorkerId = 99
 
 	// declare a reply structure.
-	reply := ExampleReply{}
+	reply := Reply{}
 
 	// send the RPC request, wait for the reply.
 	// the "Coordinator.Example" tells the
 	// receiving server that we'd like to call
 	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
+	ok := call("Coordinator.GetTask", &args, &reply)
 	if ok {
 		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
+		fmt.Printf("reply.Y %v\n", reply.FilePath)
+		return reply, nil
 	} else {
 		fmt.Printf("call failed!\n")
+		return Reply{}, ErrGetTaskFailed
+	}
+}
+
+func ReportOneTask(task_id int) error {
+	req := Request{FinishedTaskId: task_id}
+	reply := Reply{}
+
+	ok := call("Coordinator.ReportOneTask", &req, &reply)
+	if ok {
+		// reply.Y should be 100.
+		fmt.Printf("reply.Y %v\n", reply.FilePath)
+		return nil
+	} else {
+		fmt.Printf("call failed!\n")
+		return ErrReportTaskFailed
 	}
 }
 
