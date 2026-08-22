@@ -118,13 +118,12 @@ func GetTask() (Reply, error) {
 	}
 }
 
-func ReportOneTask(task_id int) error {
-	req := Request{FinishedTaskId: task_id}
+func ReportOneTask(taskID int) error {
+	req := Request{FinishedTaskId: taskID}
 	reply := Reply{}
 
 	ok := call("Coordinator.ReportOneTask", &req, &reply)
 	if ok {
-		// reply.Y should be 100.
 		fmt.Printf("reply.Y %v\n", reply.FilePath)
 		return nil
 	} else {
