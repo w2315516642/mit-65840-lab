@@ -11,16 +11,26 @@ package mr
 // and reply for an RPC.
 //
 
+type taskType string
+
+const (
+	MapTask    taskType = "MapTask"
+	ReduceTask taskType = "ReduceTask"
+	Wait       taskType = "Wait"
+	Exit       taskType = "Exit"
+)
+
 type Request struct {
-	WorkerId       int
-	FinishedTaskId int
+	WorkerID       int
+	FinishedTaskID int
 }
 
 type Reply struct {
-	MapDone   bool
+	TaskType  taskType
 	FilePath  string
 	NumReduce int
-	TaskId    int
+	NumMap    int
+	TaskID    int
 }
 
 // Add your RPC definitions here.

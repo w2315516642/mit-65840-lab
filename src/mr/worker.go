@@ -1,21 +1,30 @@
 package mr
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )
 
-// Map functions return a slice of KeyValue.
+// KeyValue : Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 var (
 	ErrGetTaskFailed    = errors.New("[worker]: Get task failed.")
@@ -44,41 +53,43 @@ func Worker(
 	// Your worker implementation here.
 
 	for {
-		err := RunOneLoop(mapf)
-		if err == SuccessAllTaskDone {
-			break
+		reply, err := GetTask()
+		if err != nil {
+			fmt.Println("get task failed, err: ", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		if reply.TaskType == Exit {
+			return
+		}
+
+		if reply.TaskType == MapTask {
+			err = RunOnceMapLoop(reply, mapf)
+		} else if reply.TaskType == ReduceTask {
+			err = RunOnceReduceLoop(reply, reducef)
 		}
 
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func RunOneLoop(mapf func(string, string) []KeyValue) error {
-	reply, err := GetTask()
-	if err != nil {
-		fmt.Println("error")
-		return ErrGetTaskFailed
-	}
-
-	if reply.MapDone {
-		return SuccessAllTaskDone
-	}
-
+func RunOnceMapLoop(reply Reply, mapf func(string, string) []KeyValue) error {
 	file := reply.FilePath
-	taskID := reply.TaskId
+	taskID := reply.TaskID
 
 	contents, _ := os.ReadFile(file)
 	kva := mapf(file, string(contents))
 
 	for i := 0; i < reply.NumReduce; i++ {
 		oname := "mr-" + strconv.Itoa(taskID) + "-" + strconv.Itoa(i)
-		os.Remove(oname)
+		os.Create(oname)
 	}
 
 	for _, kv := range kva {
-		out_id := ihash(kv.Key) % reply.NumReduce
-		out_id_str := strconv.Itoa(out_id)
-		oname := "mr-" + strconv.Itoa(taskID) + "-" + out_id_str
+		outID := ihash(kv.Key) % reply.NumReduce
+		outIDStr := strconv.Itoa(outID)
+		oname := "mr-" + strconv.Itoa(taskID) + "-" + outIDStr
 		ofile, oErr := os.OpenFile(oname,
 			os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o666)
 		if oErr != nil {
@@ -89,16 +100,75 @@ func RunOneLoop(mapf func(string, string) []KeyValue) error {
 		ofile.Close()
 	}
 
-	return ReportOneTask(taskID)
+	return ReportMapTask(taskID)
+}
+
+func RunOnceReduceLoop(reply Reply, reducef func(string, []string) string) error {
+	reduceID := reply.TaskID
+
+	var key string
+	var value string
+
+	intermediate := []KeyValue{}
+
+	for i := 0; i < reply.NumMap; i++ {
+		fileName := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reduceID)
+		file, err := os.OpenFile(fileName, os.O_RDONLY, 0o666)
+		if err != nil {
+			return ErrGetTaskFailed
+		}
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := scanner.Text()
+			_, err := fmt.Sscanf(line, "%s %s", &key, &value)
+			if err != nil {
+				return ErrGetTaskFailed
+			}
+
+			intermediate = append(intermediate, KeyValue{key, value})
+		}
+
+		if err := scanner.Err(); err != nil {
+			// 这里说明不是正常 EOF，而是读文件出错
+			return ErrGetTaskFailed
+		}
+	}
+
+	sort.Sort(ByKey(intermediate))
+
+	oname := "mr-out-" + strconv.Itoa(reply.TaskID)
+	ofile, _ := os.Create(oname)
+
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+
+	return ReportReduceTask(reply.TaskID)
 }
 
 // example function to show how to make an RPC call to the coordinator.
-//
 // the RPC argument and reply types are defined in rpc.go.
 func GetTask() (Reply, error) {
 	// declare an argument structure.
 	args := Request{}
-	args.WorkerId = 99
+	args.WorkerID = 99
 
 	// declare a reply structure.
 	reply := Reply{}
@@ -118,11 +188,25 @@ func GetTask() (Reply, error) {
 	}
 }
 
-func ReportOneTask(taskID int) error {
-	req := Request{FinishedTaskId: taskID}
+func ReportReduceTask(taskID int) error {
+	req := Request{FinishedTaskID: taskID}
 	reply := Reply{}
 
-	ok := call("Coordinator.ReportOneTask", &req, &reply)
+	ok := call("Coordinator.ReportReduceTask", &req, &reply)
+	if ok {
+		fmt.Printf("reply.Y %v\n", reply.FilePath)
+		return nil
+	} else {
+		fmt.Printf("call failed!\n")
+		return ErrReportTaskFailed
+	}
+}
+
+func ReportMapTask(taskID int) error {
+	req := Request{FinishedTaskID: taskID}
+	reply := Reply{}
+
+	ok := call("Coordinator.ReportMapTask", &req, &reply)
 	if ok {
 		fmt.Printf("reply.Y %v\n", reply.FilePath)
 		return nil

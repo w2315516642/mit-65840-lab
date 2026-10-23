@@ -1,8 +1,6 @@
 package mr
 
 import (
-	"errors"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -10,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 type TaskState string
@@ -21,16 +20,18 @@ const (
 )
 
 type TaskStatus struct {
-	state   TaskState
-	task_id int
+	state  TaskState
+	taskID int
 }
 
 type Coordinator struct {
 	// Your definitions here.
-	nReduce int
-	files   []string
-	status  map[string]TaskStatus
-	nRemain int
+	nReduce      int
+	files        []string
+	MapStatus    map[string]TaskStatus
+	ReduceStatus map[string]TaskStatus
+	mapRemain    int
+	reduceRemain int
 
 	mu sync.RWMutex
 }
@@ -38,93 +39,160 @@ type Coordinator struct {
 // Your code here -- RPC handlers for the worker to call.
 
 // an example RPC handler.
-//
 // the RPC argument and reply types are defined in rpc.go.
 func (c *Coordinator) GetTask(req *Request, rep *Reply) error {
-	ok, file := c.GetOneIdleTask()
-	rep.MapDone = false
-	rep.FilePath = file
-	rep.NumReduce = c.nReduce
+	ret := c.GetOneIdleTask()
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	rep.TaskId = c.status[file].task_id
+	if ret.TaskType == MapTask || ret.TaskType == ReduceTask {
+		go func() {
+			c.Retry(ret.FilePath, ret.TaskType)
+		}()
+	}
 
-	if ok {
-		if file == "" {
-			rep.MapDone = true
-			fmt.Println("[Coordinator]: All task done.")
-			return nil
+	*rep = ret
+
+	return nil
+}
+
+func (c *Coordinator) Retry(file string, tType taskType) {
+	time.Sleep(12 * time.Second)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if tType == MapTask {
+		status := c.MapStatus[file]
+		if status.state == InProgress {
+			status.state = Idle
+			c.MapStatus[file] = status
 		}
-		fmt.Println("[Coordinator]: Get task success! file: %s, worker: %d", file, req.WorkerId)
+	} else if tType == ReduceTask {
+		status := c.ReduceStatus[file]
+		if status.state == InProgress {
+			status.state = Idle
+			c.ReduceStatus[file] = status
+		}
+	}
+}
+
+func (c *Coordinator) ReportReduceTask(req *Request, rep *Reply) error {
+	taskID := req.FinishedTaskID
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.ReduceStatus[strconv.Itoa(taskID)].state == Done {
 		return nil
-	} else {
-		fmt.Println("[Coordinator]: Get task failed. worker: %d", req.WorkerId)
-		return errors.New("get task failed")
 	}
-}
 
-func (c *Coordinator) ReportOneTask(req *Request, rep *Reply) error {
-	task_id := req.FinishedTaskId
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	new_status := TaskStatus{
-		state:   Done,
-		task_id: task_id,
+	newStatus := TaskStatus{
+		state:  Done,
+		taskID: taskID,
 	}
-	c.status[c.files[task_id]] = new_status
-	if c.nRemain > 0 {
-		c.nRemain -= 1
+	c.ReduceStatus[strconv.Itoa(taskID)] = newStatus
+	if c.reduceRemain > 0 {
+		c.reduceRemain -= 1
 	}
 
 	return nil
 }
 
-func (c *Coordinator) GetOneIdleTask() (bool, string) {
-	ok := false
+func (c *Coordinator) ReportMapTask(req *Request, rep *Reply) error {
+	taskID := req.FinishedTaskID
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.nRemain == 0 {
-		return true, ""
+	fileName := c.files[taskID]
+	if c.MapStatus[fileName].state == Done {
+		return nil
 	}
 
-	for file, status := range c.status {
-		if status.state == Idle {
-			ok = true
-			new_status := TaskStatus{
-				state:   InProgress,
-				task_id: c.status[file].task_id,
+	newStatus := TaskStatus{
+		state:  Done,
+		taskID: taskID,
+	}
+	c.MapStatus[c.files[taskID]] = newStatus
+	if c.mapRemain > 0 {
+		c.mapRemain -= 1
+	}
+
+	return nil
+}
+
+func (c *Coordinator) GetOneIdleTask() Reply {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	reply := Reply{
+		FilePath:  "",
+		NumReduce: c.nReduce,
+		NumMap:    len(c.files),
+		TaskType:  Wait,
+	}
+
+	if c.reduceRemain == 0 {
+		reply.TaskType = Exit
+
+		return reply
+	}
+
+	if c.mapRemain == 0 {
+		// 发放 reduce 任务
+		for id, status := range c.ReduceStatus {
+			if status.state == Idle {
+				newStatus := TaskStatus{
+					state:  InProgress,
+					taskID: c.ReduceStatus[id].taskID,
+				}
+				c.ReduceStatus[id] = newStatus
+
+				reply.FilePath = id
+				reply.TaskID = newStatus.taskID
+				reply.TaskType = ReduceTask
+
+				return reply
 			}
-			c.status[file] = new_status
-			return ok, file
+		}
+		return reply
+	}
+
+	for file, status := range c.MapStatus {
+		if status.state == Idle {
+			newStatus := TaskStatus{
+				state:  InProgress,
+				taskID: c.MapStatus[file].taskID,
+			}
+			c.MapStatus[file] = newStatus
+
+			reply.FilePath = file
+			reply.TaskID = newStatus.taskID
+			reply.TaskType = MapTask
+
+			return reply
 		}
 	}
-	return ok, ""
+	return reply
 }
 
-func (c *Coordinator) init() error {
-	for task_id, file := range c.files {
+func (c *Coordinator) init() {
+	for taskID, file := range c.files {
 		state := TaskStatus{
-			state:   Idle,
-			task_id: task_id,
+			state:  Idle,
+			taskID: taskID,
 		}
-		c.status[file] = state
+		c.MapStatus[file] = state
 	}
-	c.nRemain = len(c.files)
+	c.mapRemain = len(c.files)
+	c.reduceRemain = c.nReduce
 
-	nTask := c.nRemain
-	for i := 0; i < nTask; i++ {
-		for j := 0; j < c.nReduce; j++ {
-			fname := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(j)
-			os.Create(fname)
+	for i := 0; i < c.nReduce; i++ {
+		state := TaskStatus{
+			state:  Idle,
+			taskID: i,
 		}
+		c.ReduceStatus[strconv.Itoa(i)] = state
 	}
-
-	return nil
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -142,20 +210,11 @@ func (c *Coordinator) server(sockname string) {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := true
-
 	// Your code here.
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	for _, status := range c.status {
-		if status.state != Done {
-			ret = false
-			break
-		}
-	}
-
-	return ret
+	return c.reduceRemain == 0
 }
 
 // create a Coordinator.
@@ -163,9 +222,10 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		files:   files,
-		nReduce: nReduce,
-		status:  make(map[string]TaskStatus),
+		files:        files,
+		nReduce:      nReduce,
+		MapStatus:    make(map[string]TaskStatus),
+		ReduceStatus: make(map[string]TaskStatus),
 	}
 
 	// Your code here.

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"6.5840/kvsrv1"
+	kvsrv "6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
 )
 
 const (
@@ -59,7 +59,8 @@ func TestReliableNested(t *testing.T) {
 }
 
 func oneClient(t *testing.T, me int, ck kvtest.IKVClerk,
-	done chan struct{}, name1 string, name2 string) kvtest.ClntRes {
+	done chan struct{}, name1 string, name2 string,
+) kvtest.ClntRes {
 	lk1 := MakeLock(ck, name1)
 	lk2 := MakeLock(ck, name2)
 
