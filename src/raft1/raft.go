@@ -19,34 +19,6 @@ import (
 	tester "6.5840/tester1"
 )
 
-// Define Set
-type Set[T comparable] struct {
-	items map[T]struct{}
-}
-
-func NewSet[T comparable]() *Set[T] {
-	return &Set[T]{items: make(map[T]struct{})}
-}
-
-func (s *Set[T]) Add(value T) {
-	s.items[value] = struct{}{}
-}
-
-func (s *Set[T]) Contains(value T) bool {
-	_, exists := s.items[value]
-	return exists
-}
-
-func (s *Set[T]) Remove(value T) {
-	delete(s.items, value)
-}
-
-func (s *Set[T]) Len() int {
-	return len(s.items)
-}
-
-// Raft
-
 type RaftRole string
 
 const (
@@ -54,6 +26,11 @@ const (
 	Candidate RaftRole = "Candidate"
 	Leader    RaftRole = "Leader"
 )
+
+type LogEntry struct {
+	Command any
+	Term    int
+}
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -65,10 +42,20 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	// Persistent states
 	currentTerm int
-	voteFor     int
-	role        RaftRole
+	votedFor    int
+	log         []LogEntry
 
+	// Volatile states
+	commitIndex int
+	lastApplied int
+
+	// Volatile states in Leader
+	nextIndex  []int
+	matchIndex []int
+
+	role     RaftRole
 	deadline time.Time
 }
 
@@ -76,14 +63,14 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	var term int
-	var isleader bool
+	var isLeader bool
 	// Your code here (3A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	term = rf.currentTerm
-	isleader = rf.role == Leader
-	return term, isleader
+	isLeader = rf.role == Leader
+	return term, isLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -145,6 +132,9 @@ type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
 	Term        int
 	CandidateID int
+
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
@@ -163,7 +153,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// 1. 判断 term 是否合法
 	if args.Term > rf.currentTerm {
-		rf.receiveBiggerTerm(args.Term)
+		rf.advanceTerm(args.Term)
 	} else if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -173,10 +163,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2. 判断是否能给这个投票
 	reply.Term = rf.currentTerm
 
-	canVote := rf.voteFor == -1 || rf.voteFor == args.CandidateID
+	canVote := rf.votedFor == -1 || rf.votedFor == args.CandidateID
 	if canVote {
 		reply.VoteGranted = true
-		rf.voteFor = args.CandidateID
+		rf.votedFor = args.CandidateID
 		rf.resetDeadline()
 	} else {
 		reply.VoteGranted = false
@@ -186,7 +176,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderID int
-	Entries  []string
+
+	PrevLogIndex int
+	PrevLogTerm  int
+
+	Entries []LogEntry
+
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -204,7 +200,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	} else if args.Term > rf.currentTerm {
-		rf.receiveBiggerTerm(args.Term)
+		rf.advanceTerm(args.Term)
 		rf.resetDeadline()
 	} else {
 		if rf.role == Candidate {
@@ -275,79 +271,87 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term = rf.currentTerm
+	isLeader = rf.role == Leader
+	if !isLeader {
+		return -1, term, false
+	}
+	// 有占位条目在 0 位置，因此这里 len 直接就是新 cmd 的 index
+	index = len(rf.log)
+
+	logEntry := LogEntry{
+		Command: command,
+		Term:    term,
+	}
+	rf.log = append(rf.log, logEntry)
+	rf.matchIndex[rf.me] = index
+	// 通知开始复制日志（待实现）
 
 	return index, term, isLeader
 }
 
-// func (rf *Raft) changeTo(role RaftRole) int {
-// 	if role == Candidate {
-// 		rf.mu.Lock()
-// 		defer rf.mu.Unlock()
-//
-// 		rf.role = Candidate
-// 		rf.currentTerm += 1
-// 		rf.voteFor = rf.me
-// 		rf.resetDeadline()
-//
-// 		return rf.currentTerm
-// 	}
-//
-// 	return -1
-// }
-
-func (rf *Raft) receiveBiggerTerm(term int) {
+// 必须得调用方持锁，传进来的 term 必须大于当前 term
+func (rf *Raft) advanceTerm(term int) {
 	rf.currentTerm = term
 	// change to Follower
-	rf.voteFor = -1
+	rf.votedFor = -1
 	rf.role = Follower
 }
 
+func (rf *Raft) heartbeatLoop(server int, term int) {
+	args := AppendEntriesArgs{
+		Term:     term,
+		LeaderID: rf.me,
+		Entries:  []LogEntry{},
+	}
+
+	// 心跳循环
+	for {
+		// 检查是否还需要发送心跳
+		rf.mu.Lock()
+		need := rf.currentTerm == args.Term && rf.role == Leader
+		if !need {
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+
+		// 发送心跳请求
+		var reply AppendEntriesReply
+		ok := rf.sendAppendEntries(server, &args, &reply)
+
+		// 处理回复
+		if ok {
+			rf.mu.Lock()
+			// 1. 处理具有更大 term 的回复
+			if reply.Term > rf.currentTerm {
+				rf.advanceTerm(reply.Term)
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
+		}
+
+		// 2. 无其它情况下睡眠即可
+		time.Sleep(time.Duration(100) * time.Millisecond)
+	}
+}
+
+// 必须得调用方持锁
 func (rf *Raft) becomeLeader() {
 	rf.role = Leader
 
-	// 启动发送心跳的 goroutine
-	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderID: rf.me,
-		Entries:  []string{},
-	}
 	for id := range rf.peers {
 		if id == rf.me {
 			continue
 		}
 
-		go func(server int) {
-			// 心跳循环
-			for {
-				// 检查是否还需要发送心跳
-				rf.mu.Lock()
-				need := rf.currentTerm == args.Term && rf.role == Leader
-				if !need {
-					rf.mu.Unlock()
-					return
-				}
-				rf.mu.Unlock()
-
-				// 发送心跳请求
-				var reply AppendEntriesReply
-				ok := rf.sendAppendEntries(server, &args, &reply)
-
-				// 处理回复
-				if ok {
-					rf.mu.Lock()
-					// 1. 处理具有更大 term 的回复
-					if reply.Term > rf.currentTerm {
-						rf.receiveBiggerTerm(reply.Term)
-						rf.mu.Unlock()
-						return
-					}
-					rf.mu.Unlock()
-				}
-
-				// 2. 无其它情况下睡眠即可
-				time.Sleep(time.Duration(100) * time.Millisecond)
-			}
-		}(id)
+		go func(server int, term int) {
+			rf.heartbeatLoop(server, term)
+		}(id, rf.currentTerm)
 	}
 }
 
@@ -355,8 +359,8 @@ func (rf *Raft) tryStartElection() {
 	rf.mu.Lock()
 
 	timeout := !time.Now().Before(rf.deadline)
-	isleader := rf.role == Leader
-	startElection := !isleader && timeout
+	isLeader := rf.role == Leader
+	startElection := !isLeader && timeout
 	if !startElection {
 		rf.mu.Unlock()
 		return
@@ -364,7 +368,7 @@ func (rf *Raft) tryStartElection() {
 
 	rf.role = Candidate
 	rf.currentTerm += 1
-	rf.voteFor = rf.me
+	rf.votedFor = rf.me
 	rf.resetDeadline()
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
@@ -399,7 +403,7 @@ func (rf *Raft) tryStartElection() {
 
 			// 1. 处理来自更大 term 的回复
 			if rf.currentTerm < reply.Term {
-				rf.receiveBiggerTerm(reply.Term)
+				rf.advanceTerm(reply.Term)
 				return
 			}
 
@@ -420,6 +424,7 @@ func (rf *Raft) tryStartElection() {
 	} // End go func
 }
 
+// 必须得调用方持锁
 func (rf *Raft) resetDeadline() {
 	ms := 200 + (rand.Int63() % 300)
 	rf.deadline = time.Now().Add(time.Duration(ms) * time.Millisecond)
@@ -460,8 +465,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.role = Follower
 	rf.currentTerm = 0
-	rf.voteFor = -1
+	rf.votedFor = -1
 	rf.resetDeadline()
+
+	// 初始化 log 相关项
+	rf.log = make([]LogEntry, 0)
+	rf.log = append(rf.log, LogEntry{Command: nil, Term: 0})
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.matchIndex = make([]int, len(peers))
+	rf.nextIndex = make([]int, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
