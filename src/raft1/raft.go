@@ -57,6 +57,9 @@ type Raft struct {
 
 	role     RaftRole
 	deadline time.Time
+	notifyCh []chan struct{}
+
+	applyCh chan raftapi.ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -163,7 +166,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2. 判断是否能给这个投票
 	reply.Term = rf.currentTerm
 
-	canVote := rf.votedFor == -1 || rf.votedFor == args.CandidateID
+	// 是否有票
+	haveVote := rf.votedFor == -1 || rf.votedFor == args.CandidateID
+	// 候选人是否有更新的日志
+	newerLog := false
+	lastLogTerm := rf.log[len(rf.log)-1].Term
+	if args.LastLogTerm > lastLogTerm {
+		newerLog = true
+	} else if args.LastLogTerm == lastLogTerm {
+		newerLog = args.LastLogIndex >= len(rf.log)-1
+	}
+	canVote := haveVote && newerLog
+
 	if canVote {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
@@ -177,12 +191,12 @@ type AppendEntriesArgs struct {
 	Term     int
 	LeaderID int
 
-	PrevLogIndex int
-	PrevLogTerm  int
+	PrevLogIndex int // 发送日志的前一条日志的 index
+	PrevLogTerm  int // 发送日志的前一条日志的 term
 
 	Entries []LogEntry
 
-	LeaderCommit int
+	LeaderCommit int // Leader 当前的提交日志 index
 }
 
 type AppendEntriesReply struct {
@@ -210,11 +224,60 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	reply.Term = rf.currentTerm
 
-	// 2. 添加 Entries
-	if len(args.Entries) == 0 {
-		reply.Success = true
+	// 2. 查看前缀日志是否匹配
+	if args.PrevLogIndex < len(rf.log) {
+		logTerm := rf.log[args.PrevLogIndex].Term
+		if logTerm != args.PrevLogTerm {
+			reply.Success = false
+			return
+		}
+	} else {
+		reply.Success = false
 		return
 	}
+
+	// 3. 逐个添加日志
+	i := 0
+	for i < len(args.Entries) {
+		logIndex := args.PrevLogIndex + 1 + i
+		exist := logIndex < len(rf.log)
+		// 3.3 不存在这个 index，直接追加
+		if !exist {
+			break
+		}
+
+		logTerm := rf.log[logIndex].Term
+		// 3.1 当前日志 index 和 term 相同，跳过
+		if logTerm == args.Entries[i].Term {
+			i++
+			continue
+			// 3.2 index 相同，term 不同，删掉当前日志后追加
+		} else {
+			// 不包括这个有差异的 log
+			rf.log = rf.log[:logIndex]
+			break
+		}
+	}
+	if i < len(args.Entries) {
+		rf.log = append(rf.log, args.Entries[i:]...)
+	}
+
+	// 4. 推进 commitIndex
+	newCommitIndex := min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+	if newCommitIndex > rf.commitIndex {
+		rf.commitIndex = newCommitIndex
+		select {
+		case rf.notifyCh[rf.me] <- struct{}{}:
+		default:
+		}
+	}
+
+	reply.Success = true
+
+	// if len(args.Entries) == 0 {
+	// 	reply.Success = true
+	// 	return
+	// }
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -288,7 +351,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.log = append(rf.log, logEntry)
 	rf.matchIndex[rf.me] = index
-	// 通知开始复制日志（待实现）
+	rf.advanceCommit()
+
+	// 通知开始复制日志
+	for id := range rf.peers {
+		if id == rf.me {
+			continue
+		}
+		select {
+		case rf.notifyCh[id] <- struct{}{}:
+		default: // 通道满了就只更新日志，不复制给 Follower 了
+		}
+	}
 
 	return index, term, isLeader
 }
@@ -301,29 +375,75 @@ func (rf *Raft) advanceTerm(term int) {
 	rf.role = Follower
 }
 
+// 外部持锁
+func (rf *Raft) advanceCommit() {
+	startIdx := rf.matchIndex[rf.me]
+	threshold := len(rf.peers)/2 + 1
+	lo := rf.commitIndex
+	for startIdx > lo {
+		cnt := 0
+
+		termValid := rf.log[startIdx].Term == rf.currentTerm
+		if termValid {
+			for id := range rf.peers {
+				indexValid := rf.matchIndex[id] >= startIdx
+				if indexValid {
+					cnt++
+				}
+			}
+		}
+
+		if cnt >= threshold {
+			// 提交
+			rf.commitIndex = startIdx
+			select {
+			case rf.notifyCh[rf.me] <- struct{}{}:
+			default:
+			}
+			break
+		}
+
+		startIdx--
+	}
+}
+
 func (rf *Raft) heartbeatLoop(server int, term int) {
-	args := AppendEntriesArgs{
-		Term:     term,
-		LeaderID: rf.me,
-		Entries:  []LogEntry{},
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	// 检查是否能够发送 AE 请求
+	valid := func() bool {
+		valid := rf.currentTerm == term && rf.role == Leader
+		return valid
 	}
 
 	// 心跳循环
 	for {
-		// 检查是否还需要发送心跳
+
 		rf.mu.Lock()
-		need := rf.currentTerm == args.Term && rf.role == Leader
-		if !need {
+		if !valid() {
 			rf.mu.Unlock()
 			return
 		}
+
+		startIdx := rf.nextIndex[server]
+		endIdx := len(rf.log) - 1
+		logs := make([]LogEntry, len(rf.log)-startIdx)
+		copy(logs, rf.log[startIdx:])
+
+		args := AppendEntriesArgs{
+			Term:         term,
+			LeaderID:     rf.me,
+			PrevLogIndex: startIdx - 1,
+			PrevLogTerm:  rf.log[startIdx-1].Term,
+			Entries:      logs,
+			LeaderCommit: rf.commitIndex,
+		}
+		var reply AppendEntriesReply
 		rf.mu.Unlock()
 
-		// 发送心跳请求
-		var reply AppendEntriesReply
 		ok := rf.sendAppendEntries(server, &args, &reply)
 
-		// 处理回复
 		if ok {
 			rf.mu.Lock()
 			// 1. 处理具有更大 term 的回复
@@ -332,11 +452,58 @@ func (rf *Raft) heartbeatLoop(server int, term int) {
 				rf.mu.Unlock()
 				return
 			}
+			// 2. 处理正常追加情况
+			if valid() {
+				if reply.Success {
+					rf.matchIndex[server] = endIdx
+					rf.nextIndex[server] = endIdx + 1
+
+					rf.advanceCommit()
+				} else {
+					rf.nextIndex[server] -= 1
+
+					rf.mu.Unlock()
+					continue
+				}
+			}
 			rf.mu.Unlock()
 		}
 
-		// 2. 无其它情况下睡眠即可
-		time.Sleep(time.Duration(100) * time.Millisecond)
+		// 刚进来的时候立即发一次心跳，然后等待事件触发
+		select {
+		// 计时器事件
+		case <-ticker.C:
+		// 主动发送 AE 请求事件
+		case <-rf.notifyCh[server]:
+		}
+
+		// 检查是否还需要发送心跳
+		// rf.mu.Lock()
+		// need := rf.currentTerm == args.Term && rf.role == Leader
+		// if !need {
+		// 	rf.mu.Unlock()
+		// 	return
+		// }
+		// rf.mu.Unlock()
+
+		// // 发送心跳请求
+		// var reply AppendEntriesReply
+		// ok := rf.sendAppendEntries(server, &args, &reply)
+		//
+		// // 处理回复
+		// if ok {
+		// 	rf.mu.Lock()
+		// 	// 1. 处理具有更大 term 的回复
+		// 	if reply.Term > rf.currentTerm {
+		// 		rf.advanceTerm(reply.Term)
+		// 		rf.mu.Unlock()
+		// 		return
+		// 	}
+		// 	rf.mu.Unlock()
+		// }
+		//
+		// // 2. 无其它情况下睡眠即可
+		// time.Sleep(time.Duration(100) * time.Millisecond)
 	}
 }
 
@@ -346,8 +513,12 @@ func (rf *Raft) becomeLeader() {
 
 	for id := range rf.peers {
 		if id == rf.me {
+			rf.matchIndex[id] = len(rf.log) - 1
 			continue
 		}
+
+		rf.matchIndex[id] = 0
+		rf.nextIndex[id] = len(rf.log)
 
 		go func(server int, term int) {
 			rf.heartbeatLoop(server, term)
@@ -371,8 +542,10 @@ func (rf *Raft) tryStartElection() {
 	rf.votedFor = rf.me
 	rf.resetDeadline()
 	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateID: rf.me,
+		Term:         rf.currentTerm,
+		CandidateID:  rf.me,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 
 	rf.mu.Unlock()
@@ -431,7 +604,7 @@ func (rf *Raft) resetDeadline() {
 }
 
 func (rf *Raft) ticker() {
-	for true {
+	for {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
@@ -442,6 +615,43 @@ func (rf *Raft) ticker() {
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
+func (rf *Raft) applyLoop() {
+	for {
+		<-rf.notifyCh[rf.me]
+
+		for {
+			rf.mu.Lock()
+
+			valid := rf.lastApplied < rf.commitIndex
+			if !valid {
+				rf.mu.Unlock()
+				break
+			}
+
+			log := rf.log[rf.lastApplied+1]
+
+			applyMsg := raftapi.ApplyMsg{
+				CommandValid:  true,
+				Command:       log.Command,
+				CommandIndex:  rf.lastApplied + 1,
+				SnapshotValid: false,
+				Snapshot:      []byte{},
+				SnapshotTerm:  0,
+				SnapshotIndex: 0,
+			}
+
+			rf.mu.Unlock()
+
+			// 等待信息发送完成
+			rf.applyCh <- applyMsg
+
+			rf.mu.Lock()
+			rf.lastApplied++
+			rf.mu.Unlock()
+		}
 	}
 }
 
@@ -476,11 +686,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 	rf.nextIndex = make([]int, len(peers))
 
+	rf.notifyCh = make([]chan struct{}, len(peers))
+	for i := range rf.notifyCh {
+		rf.notifyCh[i] = make(chan struct{}, 1)
+	}
+
+	rf.applyCh = applyCh
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applyLoop()
 
 	return rf
 }
