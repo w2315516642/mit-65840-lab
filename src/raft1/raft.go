@@ -8,12 +8,12 @@ package raft
 // raft interface.
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -86,12 +86,21 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	encode := func(x any) {
+		if err := e.Encode(x); err != nil {
+			panic(err)
+		}
+	}
+
+	encode(rf.currentTerm)
+	encode(rf.votedFor)
+	encode(rf.log)
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -101,17 +110,25 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var votedFor int
+	var log []LogEntry
+
+	decode := func(dst any) {
+		if err := d.Decode(dst); err != nil {
+			panic(err)
+		}
+	}
+
+	decode(&term)
+	decode(&votedFor)
+	decode(&log)
+
+	rf.currentTerm = term
+	rf.votedFor = votedFor
+	rf.log = log
 }
 
 // how many bytes in Raft's persisted log?
@@ -181,6 +198,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if canVote {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		rf.persist()
 		rf.resetDeadline()
 	} else {
 		reply.VoteGranted = false
@@ -202,6 +220,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// Follower 返回的下一次尝试的索引
+	NextIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -229,10 +250,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		logTerm := rf.log[args.PrevLogIndex].Term
 		if logTerm != args.PrevLogTerm {
 			reply.Success = false
+			startIdx := 0
+			for startIdx = args.PrevLogIndex; startIdx > 0; startIdx-- {
+				tmpTerm := rf.log[startIdx].Term
+				if tmpTerm != logTerm {
+					break
+				}
+			}
+			reply.NextIndex = startIdx + 1
 			return
 		}
 	} else {
 		reply.Success = false
+		// 前缀索引不存在
+		reply.NextIndex = len(rf.log)
 		return
 	}
 
@@ -260,6 +291,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if i < len(args.Entries) {
 		rf.log = append(rf.log, args.Entries[i:]...)
+		rf.persist()
 	}
 
 	// 4. 推进 commitIndex
@@ -273,11 +305,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
-
-	// if len(args.Entries) == 0 {
-	// 	reply.Success = true
-	// 	return
-	// }
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -351,6 +378,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.log = append(rf.log, logEntry)
 	rf.matchIndex[rf.me] = index
+	rf.persist()
 	rf.advanceCommit()
 
 	// 通知开始复制日志
@@ -373,6 +401,7 @@ func (rf *Raft) advanceTerm(term int) {
 	// change to Follower
 	rf.votedFor = -1
 	rf.role = Follower
+	rf.persist()
 }
 
 // 外部持锁
@@ -419,55 +448,74 @@ func (rf *Raft) heartbeatLoop(server int, term int) {
 
 	// 心跳循环
 	for {
-
 		rf.mu.Lock()
 		if !valid() {
 			rf.mu.Unlock()
 			return
 		}
-
-		startIdx := rf.nextIndex[server]
-		endIdx := len(rf.log) - 1
-		logs := make([]LogEntry, len(rf.log)-startIdx)
-		copy(logs, rf.log[startIdx:])
-
-		args := AppendEntriesArgs{
-			Term:         term,
-			LeaderID:     rf.me,
-			PrevLogIndex: startIdx - 1,
-			PrevLogTerm:  rf.log[startIdx-1].Term,
-			Entries:      logs,
-			LeaderCommit: rf.commitIndex,
-		}
-		var reply AppendEntriesReply
 		rf.mu.Unlock()
 
-		ok := rf.sendAppendEntries(server, &args, &reply)
-
-		if ok {
+		// 开一个新协程处理构造+请求+处理，避免阻塞其它请求
+		go func() {
 			rf.mu.Lock()
-			// 1. 处理具有更大 term 的回复
-			if reply.Term > rf.currentTerm {
-				rf.advanceTerm(reply.Term)
+			if !valid() {
 				rf.mu.Unlock()
 				return
 			}
-			// 2. 处理正常追加情况
-			if valid() {
-				if reply.Success {
-					rf.matchIndex[server] = endIdx
-					rf.nextIndex[server] = endIdx + 1
 
-					rf.advanceCommit()
-				} else {
-					rf.nextIndex[server] -= 1
+			startIdx := rf.nextIndex[server]
+			endIdx := len(rf.log) - 1
+			logs := make([]LogEntry, len(rf.log)-startIdx)
+			copy(logs, rf.log[startIdx:])
 
-					rf.mu.Unlock()
-					continue
+			args := AppendEntriesArgs{
+				Term:         term,
+				LeaderID:     rf.me,
+				PrevLogIndex: startIdx - 1,
+				PrevLogTerm:  rf.log[startIdx-1].Term,
+				Entries:      logs,
+				LeaderCommit: rf.commitIndex,
+			}
+			var reply AppendEntriesReply
+			rf.mu.Unlock()
+
+			ok := rf.sendAppendEntries(server, &args, &reply)
+
+			if ok {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				// 1. 处理具有更大 term 的回复
+				if reply.Term > rf.currentTerm {
+					rf.advanceTerm(reply.Term)
+					return
+				}
+				// 2. 处理正常追加情况
+				sameRequest := startIdx == rf.nextIndex[server]
+				if valid() {
+					if reply.Success {
+						// 避免旧请求回复覆盖新请求的内容
+						rf.matchIndex[server] = max(rf.matchIndex[server], endIdx)
+						rf.nextIndex[server] = max(rf.nextIndex[server], endIdx+1)
+
+						rf.advanceCommit()
+					} else if sameRequest {
+						if reply.NextIndex >= rf.matchIndex[server]+1 {
+							rf.nextIndex[server] = reply.NextIndex
+
+							// 重试
+							select {
+							case rf.notifyCh[server] <- struct{}{}:
+							default:
+							}
+						}
+						// rf.mu.Unlock()
+						// continue
+						return
+					}
 				}
 			}
-			rf.mu.Unlock()
-		}
+		}()
 
 		// 刚进来的时候立即发一次心跳，然后等待事件触发
 		select {
@@ -540,6 +588,7 @@ func (rf *Raft) tryStartElection() {
 	rf.role = Candidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.resetDeadline()
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
