@@ -2,21 +2,26 @@ package rsm
 
 import (
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 
+	crand "crypto/rand"
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Me         int
+	OpID       int
+	Req        any
+	InstanceID [16]byte
 }
-
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -38,6 +43,9 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	opID       int
+	waitTable  map[int]chan any
+	instanceID [16]byte
 }
 
 // servers[] contains the ports of the set of
@@ -65,23 +73,92 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+
+	if _, err := crand.Read(rsm.instanceID[:]); err != nil {
+		panic(err)
+	}
+
+	rsm.waitTable = make(map[int]chan any)
+	go rsm.DoOpLoop()
+
 	return rsm
+}
+
+func (rsm *RSM) DoOpLoop() {
+	for {
+		msg := <-rsm.applyCh
+
+		if msg.CommandValid {
+			// 带类型断言的取值（避免编译器认为是 any 导致取不出 Req 字段）
+			op, ok := msg.Command.(Op)
+			if ok {
+				result := rsm.sm.DoOp(op.Req)
+
+				rsm.mu.Lock()
+				channel, exist := rsm.waitTable[op.OpID]
+				rsm.mu.Unlock()
+
+				if op.Me == rsm.me && op.InstanceID == rsm.instanceID && exist {
+					channel <- result
+				}
+			}
+		}
+	}
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
 
-
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
 // try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
-
 	// Submit creates an Op structure to run a command through Raft;
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
+	rsm.mu.Lock()
+
+	op := Op{
+		Me:         rsm.me,
+		OpID:       rsm.opID,
+		Req:        req,
+		InstanceID: rsm.instanceID,
+	}
+	channel := make(chan any, 1)
+	rsm.waitTable[rsm.opID] = channel
+	rsm.opID += 1
+
+	rsm.mu.Unlock()
+
+	defer func() {
+		rsm.mu.Lock()
+		delete(rsm.waitTable, op.OpID)
+		rsm.mu.Unlock()
+	}()
+
+	_, term, isLeader := rsm.rf.Start(op)
+	if isLeader {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		// 等待处理完毕并定期检查任期变化
+		for {
+			select {
+			// 1. 正常接收到数据就返回
+			case result := <-channel:
+				return rpc.OK, result
+			// 2. 定期检查 term
+			case <-ticker.C:
+				newTerm, isleader := rsm.rf.GetState()
+				if newTerm != term || !isleader {
+					return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+				}
+			}
+		}
+	}
+
 	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 }
