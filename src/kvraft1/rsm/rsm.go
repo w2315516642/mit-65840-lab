@@ -78,6 +78,10 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		panic(err)
 	}
 
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		rsm.Restore(snapshot)
+	}
 	rsm.waitTable = make(map[int]chan any)
 	go rsm.DoOpLoop()
 
@@ -93,7 +97,9 @@ func (rsm *RSM) DoOpLoop() {
 			op, ok := msg.Command.(Op)
 			if ok {
 				result := rsm.sm.DoOp(op.Req)
+				rsm.MaybeMakeSnapshot(msg.CommandIndex)
 
+				// DoOp 结束后通知 server 返回结果
 				rsm.mu.Lock()
 				channel, exist := rsm.waitTable[op.OpID]
 				rsm.mu.Unlock()
@@ -102,8 +108,25 @@ func (rsm *RSM) DoOpLoop() {
 					channel <- result
 				}
 			}
+		} else if msg.SnapshotValid {
+			rsm.Restore(msg.Snapshot)
 		}
 	}
+}
+
+func (rsm *RSM) MaybeMakeSnapshot(index int) {
+	if rsm.maxraftstate < 0 {
+		return
+	}
+	size := rsm.rf.PersistBytes()
+	if size >= rsm.maxraftstate {
+		snapshot := rsm.sm.Snapshot()
+		rsm.rf.Snapshot(index, snapshot)
+	}
+}
+
+func (rsm *RSM) Restore(data []byte) {
+	rsm.sm.Restore(data)
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
