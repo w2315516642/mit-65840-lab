@@ -9,18 +9,21 @@ package shardkv
 //
 
 import (
+	"time"
+
 	"6.5840/shardkv1/shardgrp"
 
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
+	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardctrler"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Clerk struct {
 	clnt *tester.Clnt
 	sck  *shardctrler.ShardCtrler
-	rcks   map[tester.Tgid]*shardgrp.Clerk
+	rcks map[tester.Tgid]*shardgrp.Clerk
 	// You will have to modify this struct.
 }
 
@@ -41,6 +44,26 @@ func (ck *Clerk) GetClerk(gid tester.Tgid) (*shardgrp.Clerk, bool) {
 	return rck, ok
 }
 
+func (ck *Clerk) Shard2Clerk(shard shardcfg.Tshid) *shardgrp.Clerk {
+	var cfg *shardcfg.ShardConfig
+	for {
+		cfg = ck.sck.Query()
+		if cfg != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	gid := cfg.Shards[shard]
+	clnk, ok := ck.GetClerk(gid)
+	if !ok {
+		servers, exixt := cfg.Groups[gid]
+		if exixt && len(servers) > 0 {
+			clnk = shardgrp.MakeClerk(ck.clnt, servers)
+			ck.rcks[gid] = clnk
+		}
+	}
+	return clnk
+}
 
 // Get a key from a shardgrp.  You can use shardcfg.Key2Shard(key) to
 // find the shard responsible for the key and ck.sck.Query() to read
@@ -49,11 +72,38 @@ func (ck *Clerk) GetClerk(gid tester.Tgid) (*shardgrp.Clerk, bool) {
 // calling shardgrp.MakeClerk(ck.clnt, servers).
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
-	return "", 0, ""
+	shard := shardcfg.Key2Shard(key)
+	for {
+		clnk := ck.Shard2Clerk(shard)
+		if clnk == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		value, version, err := clnk.Get(key)
+		if err == rpc.OK {
+			return value, version, err
+		} else if err == rpc.ErrNoKey {
+			return "", 0, err
+		} else if err == rpc.ErrWrongGroup {
+			continue
+		}
+	}
 }
 
 // Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return ""
+	shard := shardcfg.Key2Shard(key)
+	for {
+		clnk := ck.Shard2Clerk(shard)
+		if clnk == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		err := clnk.Put(key, value, version)
+		if err == rpc.ErrWrongGroup {
+			continue
+		}
+		return err
+	}
 }
