@@ -94,6 +94,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
 	shard := shardcfg.Key2Shard(key)
+	retry := false
 	for {
 		clnk := ck.Shard2Clerk(shard)
 		if clnk == nil {
@@ -102,7 +103,15 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		}
 		err := clnk.Put(key, value, version)
 		if err == rpc.ErrWrongGroup {
+			retry = true
 			continue
+		} else if err == rpc.ErrWrongLeader {
+			retry = true
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if err == rpc.ErrVersion && retry {
+			err = rpc.ErrMaybe
 		}
 		return err
 	}

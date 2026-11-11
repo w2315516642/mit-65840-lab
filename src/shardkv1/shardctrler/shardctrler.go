@@ -9,6 +9,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
+	"6.5840/shardkv1/shardgrp"
 	tester "6.5840/tester1"
 )
 
@@ -81,6 +82,63 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	// Your code here.
+	value, version, err := sck.Get(sck.cfgKey)
+	if err == rpc.OK {
+		old := shardcfg.FromString(value)
+		if new.Num <= old.Num {
+			return
+		}
+
+		// 迁移
+		for i, oldGid := range old.Shards {
+			// shard id 在新配置里对应哪个 gid
+			newGid := new.Shards[i]
+			if oldGid == newGid {
+				continue
+			}
+
+			shardID := shardcfg.Tshid(i)
+
+			src := shardgrp.MakeClerk(sck.clnt, old.Groups[oldGid])
+			dst := shardgrp.MakeClerk(sck.clnt, new.Groups[newGid])
+
+			state, err := src.FreezeShard(shardID, new.Num)
+			if err != rpc.OK {
+				return
+			}
+			err = dst.InstallShard(shardID, state, new.Num)
+			if err != rpc.OK {
+				return
+			}
+			err = src.DeleteShard(shardID, new.Num)
+			if err != rpc.OK {
+				return
+			}
+
+		}
+
+		// 发布配置
+		putValue := new.String()
+		for {
+			err = sck.Put(sck.cfgKey, putValue, version)
+			if err == rpc.ErrMaybe || err == rpc.ErrVersion {
+				newValue, newVersion, getErr := sck.Get(sck.cfgKey)
+				if getErr == rpc.OK {
+					if newValue == old.String() && newVersion == version {
+						continue
+					} else if newValue == putValue {
+						return
+					} else {
+						return
+					}
+				}
+			} else if err == rpc.OK {
+				return
+			} else {
+				return
+			}
+		}
+	}
 }
 
 // Return the current configuration
